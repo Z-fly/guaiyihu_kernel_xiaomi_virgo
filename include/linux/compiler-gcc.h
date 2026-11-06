@@ -105,9 +105,10 @@
 #define gcc_header(x) _gcc_header(x)
 #if (__GNUC__ <= 4)
 #include gcc_header(__GNUC__)
-#else
-/* GCC 5+ shares these attributes; gcc4.h tests only __GNUC_MINOR__. */
+#elif (__GNUC__ == 5)
 #include gcc_header(5)
+#else
+#include gcc_header(4)
 #endif
 
 #if !defined(__noclone)

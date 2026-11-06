@@ -3,16 +3,6 @@ name: 编译KernelSU内核
 on:
   workflow_dispatch:
     inputs:
-      selinux_enforcing:
-        description: 编译SELinux严格内核
-        type: boolean
-        required: true
-        default: true
-      selinux_permissive:
-        description: 编译SELinux宽容内核
-        type: boolean
-        required: true
-        default: false
       extra_make_args:
         description: Extra make arguments
         required: false
@@ -33,8 +23,6 @@ env:
   KBUILD_BUILD_TIMESTAMP: "Wed Sep 23 00:00:00 CST 2026"
   KBUILD_BUILD_VERSION: "1"
   EXTRA_MAKE_ARGS: ${{ inputs.extra_make_args }}
-  SELINUX_ENFORCING: ${{ inputs.selinux_enforcing }}
-  SELINUX_PERMISSIVE: ${{ inputs.selinux_permissive }}
 
 jobs:
   build:
@@ -50,10 +38,6 @@ jobs:
 
       - name: Set build directories
         run: |
-          if [ "$SELINUX_ENFORCING" != "true" ] && [ "$SELINUX_PERMISSIVE" != "true" ]; then
-            echo "请至少选择一种 SELinux 编译模式" >&2
-            exit 1
-          fi
           echo "OUT_DIR=$RUNNER_TEMP/virgo-out" >> "$GITHUB_ENV"
           echo "ARTIFACT_DIR=$RUNNER_TEMP/virgo-artifacts" >> "$GITHUB_ENV"
           echo "CCACHE_DIR=$RUNNER_TEMP/virgo-ccache" >> "$GITHUB_ENV"
@@ -101,7 +85,22 @@ jobs:
           )
           make "${MAKE_ARGS[@]}" "${EXTRA_ARGS[@]}" virgo_defconfig
           scripts/config --file "$OUT_DIR/.config" --set-str LOCALVERSION "$KERNEL_LOCALVERSION" --disable LOCALVERSION_AUTO
+          scripts/config --file "$OUT_DIR/.config" \
+            --enable SECURITY_SELINUX \
+            --disable SECURITY_SELINUX_BOOTPARAM \
+            --disable SECURITY_SELINUX_DISABLE \
+            --disable SECURITY_SELINUX_DEVELOP \
+            --enable KSU \
+            --enable KSU_TAMPER_SYSCALL_TABLE \
+            --enable KSU_LSM_SECURITY_HOOKS \
+            --enable KSU_ENABLE_FULL_UID_CHECKS
           make "${MAKE_ARGS[@]}" "${EXTRA_ARGS[@]}" silentoldconfig
+          for OPTION in SECURITY_SELINUX KSU KSU_TAMPER_SYSCALL_TABLE KSU_LSM_SECURITY_HOOKS KSU_ENABLE_FULL_UID_CHECKS; do
+            grep -qx "CONFIG_${OPTION}=y" "$OUT_DIR/.config"
+          done
+          for OPTION in SECURITY_SELINUX_BOOTPARAM SECURITY_SELINUX_DISABLE SECURITY_SELINUX_DEVELOP; do
+            grep -qx "# CONFIG_${OPTION} is not set" "$OUT_DIR/.config"
+          done
           test "$(make -s "${MAKE_ARGS[@]}" "${EXTRA_ARGS[@]}" kernelrelease)" = "$KERNEL_RELEASE"
       - name: Build kernel
         run: |
@@ -122,22 +121,10 @@ jobs:
         run: |
           IMAGE_PATH="$OUT_DIR/arch/arm/boot/zImage"
           test -s "$IMAGE_PATH"
-          SELINUX_VARIANTS=()
-          if [ "$SELINUX_ENFORCING" = "true" ]; then
-            SELINUX_VARIANTS+=(enforcing)
-          fi
-          if [ "$SELINUX_PERMISSIVE" = "true" ]; then
-            SELINUX_VARIANTS+=(permissive)
-          fi
-          for SELINUX_VARIANT in "${SELINUX_VARIANTS[@]}"; do
-            if [ "$SELINUX_VARIANT" = "enforcing" ]; then
-              TEMPLATE_IMAGE=".github/boot.img"
-            else
-              TEMPLATE_IMAGE=".github/boot.selinux=permissive.img"
-            fi
-            BOOT_IMAGE="$ARTIFACT_DIR/boot-virgo-${KERNEL_RELEASE}-${GITHUB_RUN_NUMBER}-selinux-${SELINUX_VARIANT}.img"
-            test -s "$TEMPLATE_IMAGE"
-            python3 - "$TEMPLATE_IMAGE" "$IMAGE_PATH" "$BOOT_IMAGE" <<'PY'
+          TEMPLATE_IMAGE=".github/boot.img"
+          BOOT_IMAGE="$ARTIFACT_DIR/boot-virgo-${KERNEL_RELEASE}-${GITHUB_RUN_NUMBER}-selinux-enforcing.img"
+          test -s "$TEMPLATE_IMAGE"
+          python3 - "$TEMPLATE_IMAGE" "$IMAGE_PATH" "$BOOT_IMAGE" <<'PY'
           from hashlib import sha1, sha256
           from pathlib import Path
           from struct import pack, pack_into, unpack_from
@@ -201,29 +188,17 @@ jobs:
           print(f"Created {输出路径} ({len(新镜像)} bytes)")
           print(f"SHA-256: {sha256(新镜像).hexdigest()}")
           PY
-            test -s "$BOOT_IMAGE"
-            echo "BOOT_IMAGE_${SELINUX_VARIANT^^}=$BOOT_IMAGE" >> "$GITHUB_ENV"
-          done
+          test -s "$BOOT_IMAGE"
+          echo "BOOT_IMAGE_ENFORCING=$BOOT_IMAGE" >> "$GITHUB_ENV"
       - name: Show ccache statistics
         if: always()
         run: ccache --show-stats
 
       - name: Upload enforcing boot image
-        if: env.SELINUX_ENFORCING == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: virgo-enforcing-${{ github.run_number }}
           path: ${{ env.BOOT_IMAGE_ENFORCING }}
-          archive: false
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload permissive boot image
-        if: env.SELINUX_PERMISSIVE == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: virgo-permissive-${{ github.run_number }}
-          path: ${{ env.BOOT_IMAGE_PERMISSIVE }}
           archive: false
           if-no-files-found: error
           retention-days: 30
