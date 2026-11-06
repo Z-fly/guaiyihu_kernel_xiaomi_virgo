@@ -1,0 +1,229 @@
+name: 编译KernelSU内核
+
+on:
+  workflow_dispatch:
+    inputs:
+      selinux_enforcing:
+        description: 编译SELinux严格内核
+        type: boolean
+        required: true
+        default: true
+      selinux_permissive:
+        description: 编译SELinux宽容内核
+        type: boolean
+        required: true
+        default: false
+      extra_make_args:
+        description: Extra make arguments
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm
+  SUBARCH: arm
+  TOOLCHAIN_URL: https://developer.arm.com/-/cdn-downloads/permalink/legacy-linaro-gnu-toolchains/5.1-2015.08/gcc-linaro-5.1-2015.08-x86_64_arm-linux-gnueabi.tar.xz
+  TOOLCHAIN_DIR: /opt/toolchain/gcc-linaro-5.1-2015.08-x86_64_arm-linux-gnueabi
+  TOOLCHAIN_PREFIX: /opt/toolchain/gcc-linaro-5.1-2015.08-x86_64_arm-linux-gnueabi/bin/arm-linux-gnueabi-
+  KERNEL_RELEASE: 3.4.113-perf-kernelsu
+  KERNEL_LOCALVERSION: -perf-kernelsu
+  TZ: Asia/Shanghai
+  KBUILD_BUILD_TIMESTAMP: "Wed Sep 23 00:00:00 CST 2026"
+  KBUILD_BUILD_VERSION: "1"
+  EXTRA_MAKE_ARGS: ${{ inputs.extra_make_args }}
+  SELINUX_ENFORCING: ${{ inputs.selinux_enforcing }}
+  SELINUX_PERMISSIVE: ${{ inputs.selinux_permissive }}
+
+jobs:
+  build:
+    name: Build virgo_defconfig
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Set build directories
+        run: |
+          if [ "$SELINUX_ENFORCING" != "true" ] && [ "$SELINUX_PERMISSIVE" != "true" ]; then
+            echo "请至少选择一种 SELinux 编译模式" >&2
+            exit 1
+          fi
+          echo "OUT_DIR=$RUNNER_TEMP/virgo-out" >> "$GITHUB_ENV"
+          echo "ARTIFACT_DIR=$RUNNER_TEMP/virgo-artifacts" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=$RUNNER_TEMP/virgo-ccache" >> "$GITHUB_ENV"
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex git libssl-dev python3 xz-utils
+      - name: Restore ccache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ github.ref_name }}-virgo-linaro-gcc-5.1-2015.08-${{ hashFiles('arch/arm/configs/virgo_defconfig', '.github/boot.img', '.github/workflows/build.yml') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ github.ref_name }}-virgo-linaro-gcc-5.1-2015.08-
+            ccache-${{ runner.os }}-virgo-linaro-gcc-5.1-2015.08-
+      - name: Configure ccache
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache --set-config=max_size=5G
+          ccache --set-config=compiler_check=content
+          ccache --zero-stats
+      - name: Download and extract Linaro GCC 5.1.1
+        run: |
+          sudo install -d -o "$USER" -g "$(id -gn)" /opt/toolchain
+          TOOLCHAIN_ARCHIVE="$RUNNER_TEMP/gcc-linaro-5.1-2015.08.tar.xz"
+          curl -L --fail --connect-timeout 30 --max-time 300 "$TOOLCHAIN_URL" -o "$TOOLCHAIN_ARCHIVE"
+          tar -xJf "$TOOLCHAIN_ARCHIVE" -C /opt/toolchain
+          test -x "${TOOLCHAIN_PREFIX}gcc"
+          "${TOOLCHAIN_PREFIX}gcc" --version
+          echo "$TOOLCHAIN_DIR/bin" >> "$GITHUB_PATH"
+      - name: Configure kernel
+        run: |
+          mkdir -p "$OUT_DIR"
+          EXTRA_ARGS=()
+          if [ -n "$EXTRA_MAKE_ARGS" ]; then
+            read -r -a EXTRA_ARGS <<< "$EXTRA_MAKE_ARGS"
+          fi
+          MAKE_ARGS=(
+            O="$OUT_DIR"
+            ARCH="$ARCH"
+            SUBARCH="$SUBARCH"
+            CROSS_COMPILE="ccache $TOOLCHAIN_PREFIX"
+            HOSTCFLAGS="-fcommon"
+            LOCALVERSION=""
+          )
+          make "${MAKE_ARGS[@]}" "${EXTRA_ARGS[@]}" virgo_defconfig
+          scripts/config --file "$OUT_DIR/.config" --set-str LOCALVERSION "$KERNEL_LOCALVERSION" --disable LOCALVERSION_AUTO
+          make "${MAKE_ARGS[@]}" "${EXTRA_ARGS[@]}" silentoldconfig
+          test "$(make -s "${MAKE_ARGS[@]}" "${EXTRA_ARGS[@]}" kernelrelease)" = "$KERNEL_RELEASE"
+      - name: Build kernel
+        run: |
+          EXTRA_ARGS=()
+          if [ -n "$EXTRA_MAKE_ARGS" ]; then
+            read -r -a EXTRA_ARGS <<< "$EXTRA_MAKE_ARGS"
+          fi
+          MAKE_ARGS=(
+            O="$OUT_DIR"
+            ARCH="$ARCH"
+            SUBARCH="$SUBARCH"
+            CROSS_COMPILE="ccache $TOOLCHAIN_PREFIX"
+            HOSTCFLAGS="-fcommon"
+            LOCALVERSION=""
+          )
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" "${EXTRA_ARGS[@]}"
+      - name: Replace zImage in boot image
+        run: |
+          IMAGE_PATH="$OUT_DIR/arch/arm/boot/zImage"
+          test -s "$IMAGE_PATH"
+          SELINUX_VARIANTS=()
+          if [ "$SELINUX_ENFORCING" = "true" ]; then
+            SELINUX_VARIANTS+=(enforcing)
+          fi
+          if [ "$SELINUX_PERMISSIVE" = "true" ]; then
+            SELINUX_VARIANTS+=(permissive)
+          fi
+          for SELINUX_VARIANT in "${SELINUX_VARIANTS[@]}"; do
+            if [ "$SELINUX_VARIANT" = "enforcing" ]; then
+              TEMPLATE_IMAGE=".github/boot.img"
+            else
+              TEMPLATE_IMAGE=".github/boot.selinux=permissive.img"
+            fi
+            BOOT_IMAGE="$ARTIFACT_DIR/boot-virgo-${KERNEL_RELEASE}-${GITHUB_RUN_NUMBER}-selinux-${SELINUX_VARIANT}.img"
+            test -s "$TEMPLATE_IMAGE"
+            python3 - "$TEMPLATE_IMAGE" "$IMAGE_PATH" "$BOOT_IMAGE" <<'PY'
+          from hashlib import sha1, sha256
+          from pathlib import Path
+          from struct import pack, pack_into, unpack_from
+          from sys import argv
+          模板路径, 内核路径, 输出路径 = map(Path, argv[1:])
+          启动镜像 = 模板路径.read_bytes()
+          内核镜像 = 内核路径.read_bytes()
+          if len(启动镜像) < 608 or 启动镜像[:8] != b"ANDROID!":
+              raise SystemExit(f"Invalid Android boot image: {模板路径}")
+          if len(内核镜像) < 0x28 or unpack_from("<I", 内核镜像, 0x24)[0] != 0x016F2818:
+              raise SystemExit(f"Invalid ARM zImage: {内核路径}")
+          读取整数 = lambda 偏移量: unpack_from("<I", 启动镜像, 偏移量)[0]
+          段大小 = {
+              "kernel": 读取整数(8),
+              "ramdisk": 读取整数(16),
+              "second": 读取整数(24),
+              "dt": 读取整数(40),
+          }
+          页大小 = 读取整数(36)
+          if 页大小 < 608 or 页大小 & (页大小 - 1):
+              raise SystemExit(f"Invalid boot page size: {页大小}")
+          if len(启动镜像) < 页大小:
+              raise SystemExit("Truncated Android boot header")
+          对齐大小 = lambda 大小: (大小 + 页大小 - 1) // 页大小 * 页大小
+          镜像段 = {}
+          偏移量 = 页大小
+          for 段名 in ("kernel", "ramdisk", "second", "dt"):
+              大小 = 段大小[段名]
+              镜像段[段名] = 启动镜像[偏移量:偏移量 + 大小]
+              if len(镜像段[段名]) != 大小:
+                  raise SystemExit(f"Truncated boot image segment: {段名}")
+              偏移量 += 对齐大小(大小)
+          if 偏移量 != len(启动镜像):
+              raise SystemExit("Unsupported legacy boot image layout")
+          def 计算镜像标识(各段数据):
+              摘要 = sha1()
+              for 段数据 in 各段数据:
+                  摘要.update(段数据)
+                  摘要.update(pack("<I", len(段数据)))
+              return 摘要.digest()
+          包含设备树 = None
+          for 校验设备树 in (True, False):
+              if 段大小["dt"] and not 校验设备树:
+                  continue
+              段名列表 = ("kernel", "ramdisk", "second") + (("dt",) if 校验设备树 else ())
+              if 计算镜像标识(镜像段[段名] for 段名 in 段名列表) == 启动镜像[576:596]:
+                  包含设备树 = 校验设备树
+                  break
+          if 包含设备树 is None:
+              raise SystemExit("Original boot image SHA-1 does not match its segments")
+          镜像头 = bytearray(启动镜像[:页大小])
+          pack_into("<I", 镜像头, 8, len(内核镜像))
+          镜像段["kernel"] = 内核镜像
+          段名列表 = ("kernel", "ramdisk", "second") + (("dt",) if 包含设备树 else ())
+          镜像头[576:608] = 计算镜像标识(镜像段[段名] for 段名 in 段名列表) + bytes(12)
+          def 填充段(单段数据):
+              return 单段数据 + bytes(对齐大小(len(单段数据)) - len(单段数据))
+          新镜像 = bytes(镜像头) + b"".join(填充段(镜像段[段名]) for 段名 in ("kernel", "ramdisk", "second", "dt"))
+          输出路径.parent.mkdir(parents=True, exist_ok=True)
+          输出路径.write_bytes(新镜像)
+          print(f"Created {输出路径} ({len(新镜像)} bytes)")
+          print(f"SHA-256: {sha256(新镜像).hexdigest()}")
+          PY
+            test -s "$BOOT_IMAGE"
+            echo "BOOT_IMAGE_${SELINUX_VARIANT^^}=$BOOT_IMAGE" >> "$GITHUB_ENV"
+          done
+      - name: Show ccache statistics
+        if: always()
+        run: ccache --show-stats
+
+      - name: Upload enforcing boot image
+        if: env.SELINUX_ENFORCING == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: virgo-enforcing-${{ github.run_number }}
+          path: ${{ env.BOOT_IMAGE_ENFORCING }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload permissive boot image
+        if: env.SELINUX_PERMISSIVE == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: virgo-permissive-${{ github.run_number }}
+          path: ${{ env.BOOT_IMAGE_PERMISSIVE }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
